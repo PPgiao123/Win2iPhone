@@ -1,0 +1,121 @@
+name: Unity iOS IPA from Xcode Export
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Private release containing unity-ios-xcode.tar.gz
+        required: true
+        type: string
+      archive_sha256:
+        description: SHA-256 of unity-ios-xcode.tar.gz
+        required: true
+        type: string
+      scheme:
+        description: Xcode scheme
+        default: Unity-iPhone
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-ipa:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Download and verify the Xcode export
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SHA256: ${{ inputs.archive_sha256 }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+          [[ "$SHA256" =~ ^[0-9a-fA-F]{64}$ ]]
+          cd "$RUNNER_TEMP"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'unity-ios-xcode.tar.gz' --output unity-ios-xcode.tar.gz
+          printf '%s  unity-ios-xcode.tar.gz\n' "$(printf '%s' "$SHA256" | tr 'A-F' 'a-f')" | shasum -a 256 -c
+
+      - name: Build the unsigned iPhone app
+        shell: bash
+        env:
+          SCHEME: ${{ inputs.scheme }}
+        run: |
+          export_dir="$(mktemp -d "$RUNNER_TEMP/unity-xcode.XXXXXX")"
+          tar -xzf "$RUNNER_TEMP/unity-ios-xcode.tar.gz" -C "$export_dir"
+          cd "$export_dir"
+          container=(-project Unity-iPhone.xcodeproj)
+          if [[ -d Unity-iPhone.xcworkspace ]]; then
+            container=(-workspace Unity-iPhone.xcworkspace)
+          fi
+          test -s Unity-iPhone.xcodeproj/project.pbxproj
+
+          host_arch="$(uname -m)"
+          case "$host_arch" in
+            arm64) bee_arch=arm64 ;;
+            x86_64) bee_arch=x64 ;;
+            *) echo "::error::Unsupported macOS runner architecture $host_arch"; exit 1 ;;
+          esac
+          il2cpp="Il2CppOutputProject/IL2CPP/build/deploy_$host_arch"
+          for tool in process_symbols.sh process_symbols_il2cpp.sh validate-tbd.sh \
+            "$il2cpp/il2cpp" "$il2cpp/il2cpp-compile" "$il2cpp/bee_backend/mac-$bee_arch/bee_backend"; do
+            if [[ -f "$tool" ]]; then chmod +x "$tool"; fi
+          done
+
+          xcodebuild "${container[@]}" -scheme "$SCHEME" -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/unity-derived" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" PROVISIONING_PROFILE="" PROVISIONING_PROFILE_SPECIFIER="" \
+            build 2>&1 | tee "$RUNNER_TEMP/unity-xcodebuild.log"
+
+      - name: Verify and package the app
+        shell: bash
+        run: |
+          shopt -s nullglob
+          apps=("$RUNNER_TEMP"/unity-derived/Build/Products/Release-iphoneos/*.app)
+          if (( ${#apps[@]} != 1 )); then
+            echo "::error::Expected one Release-iphoneos app, found ${#apps[@]}."
+            exit 1
+          fi
+          app="${apps[0]}"
+          plist="$app/Info.plist"
+          bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")"
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")"
+          test -n "$bundle_id"
+          test ! -e "$app/embedded.mobileprovision"
+          xcrun lipo "$app/$executable" -verify_arch arm64
+          if codesign -d "$app" >/dev/null 2>&1; then
+            codesign --remove-signature "$app"
+          fi
+          staging="$(mktemp -d "$RUNNER_TEMP/unity-ipa.XXXXXX")"
+          trap 'rm -rf "$staging"' EXIT
+          mkdir -p "$staging/Payload"
+          ditto "$app" "$staging/Payload/$(basename "$app")"
+          ipa=unity-ios-unsigned.ipa
+          (cd "$staging" && zip -qry "$RUNNER_TEMP/$ipa" Payload)
+          cd "$RUNNER_TEMP"
+          unzip -tq "$ipa"
+          shasum -a 256 "$ipa" > "$ipa.sha256"
+
+      - name: Upload IPA and checksum
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: unity-ios-unsigned-ipa
+          path: |
+            ${{ runner.temp }}/unity-ios-unsigned.ipa
+            ${{ runner.temp }}/unity-ios-unsigned.ipa.sha256
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload Xcode log on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: unity-ios-xcodebuild-log
+          path: ${{ runner.temp }}/unity-xcodebuild.log
+          retention-days: 7
+          if-no-files-found: ignore

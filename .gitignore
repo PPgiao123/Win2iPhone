@@ -1,0 +1,25 @@
+# Generated Windows installer and local IPA configuration
+*.exe
+*.exe.sha256
+*.ipa-path
+*.ipa
+*.ipa.sha256
+
+# Local signing data, logs, and build archives
+.env
+.env.*
+*.p12
+*.pfx
+*.pem
+*.key
+*.mobileprovision
+*.dpapi
+*.ips
+*.crash
+*.log
+*.apk
+*.zip
+*.tar.gz
+*.tar.gz.sha256
+/release-local/
+*.crate
