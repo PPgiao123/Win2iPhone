@@ -442,27 +442,44 @@ pub async fn run_cloud_ipa_build(
 
     println!("正在触发 GitHub Actions macOS 云端编译...");
     let prev_ids = fetch_recent_run_ids(http, &auth.token, &repo_slug).await.unwrap_or_default();
-    let dispatch_resp = github_post(
+    let mut dispatch_resp = build_workflow_dispatch_request(
         http,
         &auth.token,
-        &format!("{GITHUB_API_BASE}/repos/{repo_slug}/actions/workflows/{WORKFLOW_FILE_NAME}/dispatches"),
+        &repo_slug,
+        &repo_info.default_branch,
+        &export.tag,
+        &export.sha256,
+        true,
     )
-    .header("X-GitHub-Api-Version", "2026-03-10")
-    .json(&json!({
-        "ref": repo_info.default_branch,
-        "inputs": {
-            "release_tag": export.tag,
-            "archive_sha256": export.sha256
-        }
-    }))
     .send()
     .await
     .context("触发 GitHub Actions 工作流失败")?;
-    ensure!(
-        dispatch_resp.status().is_success(),
-        "GitHub Actions 触发失败（HTTP {}）。请检查仓库 Actions 是否已启用。",
-        dispatch_resp.status()
-    );
+    if matches!(
+        dispatch_resp.status(),
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+    ) {
+        dispatch_resp = build_workflow_dispatch_request(
+            http,
+            &auth.token,
+            &repo_slug,
+            &repo_info.default_branch,
+            &export.tag,
+            &export.sha256,
+            false,
+        )
+        .send()
+        .await
+        .context("触发 GitHub Actions 工作流失败")?;
+    }
+    if !dispatch_resp.status().is_success() {
+        let status = dispatch_resp.status();
+        let body = dispatch_resp.text().await.unwrap_or_default();
+        let detail: String = body.trim().chars().take(512).collect();
+        if detail.is_empty() {
+            bail!("GitHub Actions 触发失败（HTTP {status}）。请检查仓库 Actions 是否已启用。");
+        }
+        bail!("GitHub Actions 触发失败（HTTP {status}）：{detail}");
+    }
 
     let mut run_id = None;
     let mut html_url = format!("https://github.com/{repo_slug}/actions");
@@ -731,10 +748,51 @@ fn github_get(http: &reqwest::Client, token: &str, url: &str) -> reqwest::Reques
 }
 
 fn github_post(http: &reqwest::Client, token: &str, url: &str) -> reqwest::RequestBuilder {
+    github_post_with_version(http, token, url, "2022-11-28")
+}
+
+fn github_post_with_version(
+    http: &reqwest::Client,
+    token: &str,
+    url: &str,
+    api_version: &str,
+) -> reqwest::RequestBuilder {
     http.post(url)
         .header(AUTHORIZATION, format!("Bearer {token}"))
         .header(ACCEPT, "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("X-GitHub-Api-Version", api_version)
+}
+
+fn build_workflow_dispatch_request(
+    http: &reqwest::Client,
+    token: &str,
+    repo_slug: &str,
+    default_branch: &str,
+    tag: &str,
+    sha256: &str,
+    with_run_details: bool,
+) -> reqwest::RequestBuilder {
+    let url = format!(
+        "{GITHUB_API_BASE}/repos/{repo_slug}/actions/workflows/{WORKFLOW_FILE_NAME}/dispatches"
+    );
+    let api_version = if with_run_details {
+        "2026-03-10"
+    } else {
+        "2022-11-28"
+    };
+    let mut payload = json!({
+        "ref": default_branch,
+        "inputs": {
+            "release_tag": tag,
+            "archive_sha256": sha256
+        }
+    });
+    if with_run_details {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("return_run_details".to_owned(), json!(true));
+        }
+    }
+    github_post_with_version(http, token, &url, api_version).json(&payload)
 }
 
 fn github_put(http: &reqwest::Client, token: &str, url: &str) -> reqwest::RequestBuilder {
@@ -834,6 +892,45 @@ mod tests {
         let encrypted = crate::pairing::crypt(token.as_bytes(), true)?;
         let decrypted = crate::pairing::crypt(&encrypted, false)?;
         assert_eq!(std::str::from_utf8(&decrypted)?, token);
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_request_sets_single_api_version_header() -> Result<()> {
+        let http = build_http_client()?;
+        let sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        let req_new = build_workflow_dispatch_request(
+            &http,
+            "token",
+            "owner/repo",
+            "main",
+            "tag-1",
+            sha,
+            true,
+        )
+        .build()?;
+        let versions_new: Vec<_> = req_new.headers().get_all("X-GitHub-Api-Version").iter().collect();
+        assert_eq!(versions_new.len(), 1);
+        assert_eq!(versions_new[0], "2026-03-10");
+
+        let req_legacy = build_workflow_dispatch_request(
+            &http,
+            "token",
+            "owner/repo",
+            "main",
+            "tag-1",
+            sha,
+            false,
+        )
+        .build()?;
+        let versions_legacy: Vec<_> = req_legacy
+            .headers()
+            .get_all("X-GitHub-Api-Version")
+            .iter()
+            .collect();
+        assert_eq!(versions_legacy.len(), 1);
+        assert_eq!(versions_legacy[0], "2022-11-28");
         Ok(())
     }
 }
